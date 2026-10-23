@@ -3,15 +3,16 @@ package redis_storage
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/golang-infrastructure/go-iterator"
+	"github.com/redis/go-redis/v9"
 	"github.com/storage-lock/go-storage"
 	storage_lock "github.com/storage-lock/go-storage-lock"
-	"github.com/redis/go-redis/v9"
 )
 
 // ------------------------------------------------ ---------------------------------------------------------------------
@@ -257,11 +258,15 @@ func (x *RedisStorage) Watch(ctx context.Context, lockId string) (<-chan *storag
 }
 
 func (x *RedisStorage) tryWatchWithPublish(ctx context.Context, lockId string) (<-chan *storage.LockInformation, error) {
+	pubsub := x.client.Subscribe(ctx, x.publishChannel(lockId))
+	if _, err := pubsub.Receive(ctx); err != nil {
+		_ = pubsub.Close()
+		return nil, err
+	}
+
 	channel := make(chan *storage.LockInformation, 1)
 	go func() {
 		defer close(channel)
-
-		pubsub := x.client.Subscribe(ctx, x.publishChannel(lockId))
 		defer pubsub.Close()
 
 		ch := pubsub.Channel()
@@ -297,11 +302,15 @@ func (x *RedisStorage) tryWatchWithPublish(ctx context.Context, lockId string) (
 }
 
 func (x *RedisStorage) tryWatchWithKeyevent(ctx context.Context, lockId string) (<-chan *storage.LockInformation, error) {
+	pubsub := x.client.Subscribe(ctx, x.keyeventChannel(lockId))
+	if _, err := pubsub.Receive(ctx); err != nil {
+		_ = pubsub.Close()
+		return nil, err
+	}
+
 	channel := make(chan *storage.LockInformation, 1)
 	go func() {
 		defer close(channel)
-
-		pubsub := x.client.Subscribe(ctx, x.keyeventChannel(lockId))
 		defer pubsub.Close()
 
 		ch := pubsub.Channel()
@@ -367,6 +376,10 @@ func (x *RedisStorage) parseWatchPayload(payload string) (*storage.LockInformati
 func (x *RedisStorage) currentLockInformation(ctx context.Context, lockId string) (*storage.LockInformation, error) {
 	raw, err := x.Get(ctx, lockId)
 	if err != nil {
+		// Watch 快照场景：锁不存在表示"当前没有锁"，返回 nil 而非错误。
+		if errors.Is(err, storage_lock.ErrLockNotFound) {
+			return nil, nil
+		}
 		return nil, err
 	}
 	if strings.TrimSpace(raw) == "" {
